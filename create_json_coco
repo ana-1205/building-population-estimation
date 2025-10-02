@@ -1,0 +1,330 @@
+# Install required libraries
+!pip install pycocotools opencv-python-headless
+
+import os
+import json
+import cv2
+import numpy as np
+from PIL import Image
+from datetime import datetime
+from google.colab import drive
+from pycocotools import mask as mask_utils
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Configuration - CORRECTED PATHS
+images_folder = "/content/drive/MyDrive/building_segmentation_dataset/tiles_images"
+masks_folder = "/content/drive/MyDrive/building_segmentation_dataset/tiles_masks_8bit"
+output_json_path = "/content/drive/MyDrive/building_segmentation_dataset/annotation_buildings.json"
+
+# First, let's debug the file structure
+print("Debugging file structure...")
+print(f"Images folder: {images_folder}")
+print(f"Masks folder: {masks_folder}")
+
+# Check if folders exist
+if not os.path.exists(images_folder):
+    print(f"ERROR: Images folder does not exist: {images_folder}")
+    # Try to find the correct path
+    possible_paths = [
+        "/content/drive/MyDrive/building_segmentation_dataset/tiles_images",
+        "/content/drive/MyDrive/building segmentation_dataset/tiles_images",
+        "/content/drive/MyDrive/building_segmentation_dataset/images",
+        "/content/drive/MyDrive/building segmentation_dataset/images",
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            images_folder = path
+            print(f"Found images at: {path}")
+            break
+else:
+    image_files = [f for f in os.listdir(images_folder)
+                  if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'))]
+    print(f"Found {len(image_files)} images in images folder:")
+    for img in image_files[:5]:
+        print(f"  - {img}")
+    if len(image_files) > 5:
+        print(f"  - ... and {len(image_files) - 5} more")
+
+if not os.path.exists(masks_folder):
+    print(f"ERROR: Masks folder does not exist: {masks_folder}")
+    # Try to find the correct path
+    possible_paths = [
+        "/content/drive/MyDrive/building_segmentation_dataset/tiles_masks_8bit",
+        "/content/drive/MyDrive/building segmentation_dataset/tiles_masks_8bit",
+        "/content/drive/MyDrive/building_segmentation_dataset/masks",
+        "/content/drive/MyDrive/building segmentation_dataset/masks",
+        "/content/drive/MyDrive/building_segmentation_dataset/tiles_masks",
+        "/content/drive/MyDrive/building segmentation_dataset/tiles_masks",
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            masks_folder = path
+            print(f"Found masks at: {path}")
+            break
+else:
+    mask_files = [f for f in os.listdir(masks_folder)
+                 if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'))]
+    print(f"Found {len(mask_files)} masks in masks folder:")
+    for mask in mask_files[:5]:
+        print(f"  - {mask}")
+    if len(mask_files) > 5:
+        print(f"  - ... and {len(mask_files) - 5} more")
+
+def find_matching_mask(image_name, mask_files):
+    """
+    Find the matching mask file for a given image name
+    Handles different naming patterns
+    """
+    # Remove file extension from image name
+    image_base = os.path.splitext(image_name)[0]
+
+    # Try different patterns - these are common mask naming conventions
+    patterns_to_try = [
+        f"mask_{image_base}",
+        f"{image_base}_mask",
+        f"{image_base}",
+        image_base.replace('image', 'mask'),
+        image_base.replace('img', 'mask'),
+        image_base.replace('train', 'mask'),
+        image_base.replace('tile', 'mask'),
+    ]
+
+    # Also try with different extensions
+    extensions = ['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp']
+
+    for pattern in patterns_to_try:
+        for ext in extensions:
+            potential_mask = f"{pattern}{ext}"
+            if potential_mask in mask_files:
+                return potential_mask
+
+    # If no pattern matches, try direct match (some datasets use same filenames)
+    if image_name in mask_files:
+        return image_name
+
+    return None
+
+def analyze_mask_content(mask_path):
+    """Analyze the content of a mask to understand its format"""
+    try:
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            with Image.open(mask_path) as pil_mask:
+                mask = np.array(pil_mask.convert('L'))
+
+        unique_vals = np.unique(mask)
+        print(f"Mask analysis: {os.path.basename(mask_path)}")
+        print(f"  Unique values: {unique_vals}")
+        print(f"  Shape: {mask.shape}, dtype: {mask.dtype}")
+        print(f"  Value range: {mask.min()} to {mask.max()}")
+
+        # Show value distribution
+        for val in unique_vals:
+            count = np.sum(mask == val)
+            percentage = (count / mask.size) * 100
+            print(f"  Value {val}: {count} pixels ({percentage:.2f}%)")
+
+        return mask
+    except Exception as e:
+        print(f"Error analyzing mask {mask_path}: {e}")
+        return None
+
+def create_coco_annotations(images_dir, masks_dir, output_path):
+    """
+    Create COCO format JSON annotation file from images and binary masks
+    Each white polygon in masks is treated as a separate building instance
+    """
+
+    # Get all files
+    image_files = [f for f in os.listdir(images_dir)
+                  if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'))]
+    mask_files = [f for f in os.listdir(masks_dir)
+                 if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'))]
+
+    print(f"\nStarting COCO annotation creation with {len(image_files)} images and {len(mask_files)} masks")
+
+    # COCO dataset structure
+    coco_output = {
+        "info": {
+            "description": "Building Segmentation Dataset",
+        },
+        "images": [],
+        "annotations": [],
+        "categories": [{
+            "id": 1,
+            "name": "building",
+            "supercategory": "structure"
+        }]
+    }
+
+    image_id = 1
+    annotation_id = 1
+    processed_count = 0
+    total_buildings = 0
+
+    # First, analyze a few masks to understand their format
+    print("\nAnalyzing mask formats...")
+    sample_masks = mask_files[:3] if len(mask_files) >= 3 else mask_files
+    for mask_file in sample_masks:
+        mask_path = os.path.join(masks_dir, mask_file)
+        analyze_mask_content(mask_path)
+
+    for img_file in image_files:
+        # Find matching mask
+        mask_file = find_matching_mask(img_file, mask_files)
+
+        if not mask_file:
+            print(f"No mask found for image: {img_file}")
+            continue
+
+        # Read image to get dimensions
+        img_path = os.path.join(images_dir, img_file)
+        mask_path = os.path.join(masks_dir, mask_file)
+
+        try:
+            with Image.open(img_path) as img:
+                width, height = img.size
+        except Exception as e:
+            print(f"Error reading image {img_file}: {e}")
+            continue
+
+        # Add image info to COCO
+        coco_output["images"].append({
+            "id": image_id,
+            "width": width,
+            "height": height,
+            "file_name": img_file,
+            "license": 1,
+            "date_captured": datetime.now().isoformat()
+        })
+
+        # Process corresponding mask
+        try:
+            # Read mask as grayscale
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                # Try with PIL if OpenCV fails
+                try:
+                    with Image.open(mask_path) as pil_mask:
+                        mask = np.array(pil_mask.convert('L'))
+                except:
+                    print(f"Error reading mask {mask_file}")
+                    continue
+
+            # Resize mask if dimensions don't match
+            if mask.shape[0] != height or mask.shape[1] != width:
+                print(f"Resizing mask {mask_file} from {mask.shape} to ({height}, {width})")
+                mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+
+            # DEBUG: Check mask content
+            unique_vals = np.unique(mask)
+            print(f"Processing: {img_file} -> {mask_file}")
+            print(f"Mask values: {unique_vals}, range: {mask.min()}-{mask.max()}")
+
+            # Try different approaches to binarize the mask
+            binary_mask = None
+
+            # Approach 1: If mask has only 0 and 255 (typical binary mask)
+            if set(unique_vals).issubset({0, 255}):
+                binary_mask = mask
+                print("  Using binary mask as-is (0 and 255)")
+
+            # Approach 2: If mask has 0 and 1 (some formats)
+            elif set(unique_vals).issubset({0, 1}):
+                binary_mask = (mask * 255).astype(np.uint8)
+                print("  Converting 0/1 mask to 0/255")
+
+            # Approach 3: If buildings are black on white background
+            elif mask[0, 0] > 127:  # Check if background is white
+                binary_mask = 255 - mask
+                print("  Inverting mask (black buildings on white background)")
+
+            # Approach 4: Use Otsu's thresholding for grayscale masks
+            else:
+                _, binary_mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                print("  Using Otsu's thresholding")
+
+            # Find contours in the mask
+            contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            print(f"  Found {len(contours)} contours")
+
+            building_count = 0
+            for contour in contours:
+                # Skip very small contours (noise)
+                area = cv2.contourArea(contour)
+                if area < 25:  # Increased minimum area to filter noise
+                    continue
+
+                # Convert contour to COCO polygon format
+                segmentation = contour.flatten().tolist()
+
+                # Get bounding box
+                x, y, w, h = cv2.boundingRect(contour)
+
+                # Add annotation
+                coco_output["annotations"].append({
+                    "id": annotation_id,
+                    "image_id": image_id,
+                    "category_id": 1,
+                    "segmentation": [segmentation],
+                    "area": float(area),
+                    "bbox": [float(x), float(y), float(w), float(h)],
+                    "iscrowd": 0
+                })
+
+                annotation_id += 1
+                building_count += 1
+                total_buildings += 1
+
+            print(f"  Extracted {building_count} buildings from this image")
+            processed_count += 1
+
+        except Exception as e:
+            print(f"Error processing {img_file} with mask {mask_file}: {e}")
+            continue
+
+        image_id += 1
+
+    # Save COCO JSON
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(coco_output, f, indent=2)
+
+    print(f"\nCOCO annotation file created: {output_path}")
+    print(f"Total images processed: {processed_count}/{len(image_files)}")
+    print(f"Total buildings annotated: {total_buildings}")
+    print(f"Total annotations: {len(coco_output['annotations'])}")
+
+    return coco_output
+
+# Run the function to create COCO annotations
+print("\n" + "="*50)
+print("Creating COCO annotations...")
+print("="*50)
+
+coco_data = create_coco_annotations(images_folder, masks_folder, output_json_path)
+
+# Show detailed results
+if coco_data['annotations']:
+    print("\nAnnotation details:")
+    print(f"First image: {coco_data['images'][0]['file_name']}")
+    print(f"First annotation bbox: {coco_data['annotations'][0]['bbox']}")
+    print(f"First annotation area: {coco_data['annotations'][0]['area']}")
+else:
+    print("\nNo annotations were created. Let's debug further:")
+
+    # Test the matching function with actual files
+    image_samples = [f for f in os.listdir(images_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif'))][:5]
+    mask_samples = [f for f in os.listdir(masks_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif'))]
+
+    print("Testing file matching for first 5 images:")
+    for img in image_samples:
+        mask_match = find_matching_mask(img, mask_samples)
+        print(f"Image: {img} -> Mask: {mask_match}")
+
+        if mask_match:
+            # Analyze the mask content
+            mask_path = os.path.join(masks_folder, mask_match)
+            analyze_mask_content(mask_path)
