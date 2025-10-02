@@ -1,0 +1,103 @@
+!pip install rasterio
+
+import os
+import glob
+import numpy as np
+import rasterio
+from rasterio.warp import reproject, Resampling
+from rasterio.enums import Resampling as ResampleEnum
+from rasterio.windows import Window
+from google.colab import drive
+from PIL import Image
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Input folders
+big_img_dir = "/content/drive/MyDrive/orig_images"
+big_mask_dir = "/content/drive/MyDrive/orig_masks"
+
+# Output folders
+output_img_dir = "/content/drive/MyDrive/building_segmentation_dataset/tiles_images"
+output_mask_dir = "/content/drive/MyDrive/building_segmentation_dataset/tiles_masks_8bit"
+os.makedirs(output_img_dir, exist_ok=True)
+os.makedirs(output_mask_dir, exist_ok=True)
+
+# Parameters
+tile_size = 1024
+stride = 1024
+min_foreground_ratio = 0.05  # 5%
+
+def load_aligned_arrays(img_path, mask_path):
+    """Load RGB image + mask aligned using rasterio."""
+    with rasterio.open(img_path) as src_img, rasterio.open(mask_path) as src_mask:
+        # Read RGB
+        img = src_img.read([1, 2, 3]).transpose(1, 2, 0)  # shape (H, W, 3)
+
+        # Prepare aligned mask array
+        mask = np.zeros((src_img.height, src_img.width), dtype=np.uint8)
+
+        reproject(
+            source=rasterio.band(src_mask, 1),
+            destination=mask,
+            src_transform=src_mask.transform,
+            src_crs=src_mask.crs,
+            dst_transform=src_img.transform,
+            dst_crs=src_img.crs,
+            resampling=ResampleEnum.nearest
+        )
+
+    return img, mask
+
+def tile_image_and_mask(img, mask, tile_size=1024, stride=1024):
+    """Tile aligned arrays into crops."""
+    h, w = img.shape[:2]
+    image_tiles, mask_tiles = [], []
+
+    for y in range(0, h - tile_size + 1, stride):
+        for x in range(0, w - tile_size + 1, stride):
+            img_crop = img[y:y+tile_size, x:x+tile_size]
+            mask_crop = mask[y:y+tile_size, x:x+tile_size]
+
+            image_tiles.append(Image.fromarray(img_crop))
+            mask_tiles.append(Image.fromarray(mask_crop))
+
+    return image_tiles, mask_tiles
+
+# Processing loop
+big_images = sorted(glob.glob(os.path.join(big_img_dir, "*.tif")))
+tile_count, skipped_count = 0, 0
+
+for img_path in big_images:
+    filename = os.path.basename(img_path)
+    mask_path = os.path.join(big_mask_dir, f"mask_{filename}")
+
+    if not os.path.exists(mask_path):
+        print(f"⚠️ No mask found for {filename}, skipping...")
+        continue
+
+    # Load aligned arrays
+    big_img, big_mask = load_aligned_arrays(img_path, mask_path)
+
+    # Tile them
+    image_tiles, mask_tiles = tile_image_and_mask(big_img, big_mask, tile_size, stride)
+    print(f"Processing {filename}: {len(image_tiles)} tiles generated")
+
+    # Save only tiles with enough foreground
+    for i, (img_tile, mask_tile) in enumerate(zip(image_tiles, mask_tiles)):
+        mask_array = np.array(mask_tile)
+        mask_bin = (mask_array > 0).astype(np.uint8)
+        foreground_ratio = mask_bin.mean()
+
+        if foreground_ratio < min_foreground_ratio:
+            skipped_count += 1
+            continue
+
+        img_filename = f"{os.path.splitext(filename)[0]}_tile_{i:04d}.tif"
+        mask_filename = f"mask_{os.path.splitext(filename)[0]}_tile_{i:04d}.tif"
+
+        img_tile.save(os.path.join(output_img_dir, img_filename))
+        mask_tile.save(os.path.join(output_mask_dir, mask_filename))
+        tile_count += 1
+
+print(f"Finished tiling. Saved {tile_count} tiles. Skipped {skipped_count} empty/near-empty tiles.")
